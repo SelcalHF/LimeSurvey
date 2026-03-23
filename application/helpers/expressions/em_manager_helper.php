@@ -5127,22 +5127,87 @@ class LimeExpressionManager
 
             $sdata = array_filter($sdata);
             SurveyDynamic::sid($this->sid);
-            $oSurvey = new SurveyDynamic();
 
-            try {
-                $iNewID = $oSurvey->insertRecords($sdata);
-                if (!$iNewID) {
-                    throw new Exception("Error, no entry id was returned.", 1);
+            // ----------------------------------------------------------------
+            // FIX: Prevent duplicate response rows from concurrent requests
+            // (when email clients, security scanners or
+            // browsers prefetch survey URLs).
+            //
+            // When the survey is non-anonymous and has a token, use a
+            // database transaction with SELECT ... FOR UPDATE to atomically
+            // check whether a response row for this token already exists
+            // before inserting. This prevents two concurrent requests from
+            // each creating their own row for the same token. This results
+            // in answer rows with no token, and hence, lost or untraceable
+            // data.
+            // ----------------------------------------------------------------
+            $bHasToken = !empty($sdata['token']);
+            $bAnonymized = ($this->surveyOptions['anonymized'] != false);
+            $srid = null;
+
+            if ($bHasToken && !$bAnonymized) {
+                $oDB = Yii::app()->db;
+                $sTableName = SurveyDynamic::model($this->sid)->tableName();
+                $oTransaction = $oDB->beginTransaction();
+                try {
+                    // Lock any existing row for this token.
+                    // If a concurrent transaction is mid-INSERT for the same
+                    // token, processing blocks here until it commits or rolls back.
+                    $existingRow = $oDB->createCommand(
+                        "SELECT id FROM " . $oDB->quoteTableName($sTableName)
+                        . " WHERE token = :token"
+                        . " ORDER BY id ASC LIMIT 1 FOR UPDATE"
+                    )->queryRow(true, array(':token' => $sdata['token']));
+
+                    if ($existingRow && !empty($existingRow['id'])) {
+                        // A response row already exists for this token.
+                        // A concurrent request created it — reuse it.
+                        $srid = $existingRow['id'];
+                        $_SESSION[$this->sessid]['srid'] = $srid;
+                    } else {
+                        // No existing row — we are the first. INSERT now,
+                        // still inside the transaction so the row is locked for concurrent requests.
+                        $oSurvey = new SurveyDynamic();
+                        $iNewID = $oSurvey->insertRecords($sdata);
+                        if (!$iNewID) {
+                            throw new Exception("Error, no entry id was returned.", 1);
+                        }
+                        $srid = $iNewID;
+                        $_SESSION[$this->sessid]['srid'] = $iNewID;
+                    }
+
+                    $oTransaction->commit();
+                } catch (Exception $e) {
+                    try {
+                        $oTransaction->rollback();
+                    } catch (Exception $rollbackEx) {
+                        // Already rolled back or connection lost
+                    }
+                    // If the transactional path failed entirely, fall through
+                    // to the original non-transactional INSERT below.
+                    $srid = null;
                 }
-                $srid = $iNewID;
-                $_SESSION[$this->sessid]['srid'] = $iNewID;
-            } catch (Exception $e) {
-                $srid = null;
-                $query = $e->getMessage();
-                $trace = $e->getTraceAsString();
-                $message = submitfailed($this->gT("Unable to insert record into survey table"), $query . "\n\n" . $trace);
-                LimeExpressionManager::addFrontendFlashMessage('error', $message, $this->sid);
-                return $message;
+            }
+
+            // Original INSERT path: used for anonymous surveys (no token to
+            // lock on), or as a fallback if the transactional path above failed.                                                       
+            if (empty($srid)) {
+                $oSurvey = new SurveyDynamic();
+                try {
+                    $iNewID = $oSurvey->insertRecords($sdata);
+                    if (!$iNewID) {
+                        throw new Exception("Error, no entry id was returned.", 1);
+                    }
+                    $srid = $iNewID;
+                    $_SESSION[$this->sessid]['srid'] = $iNewID;
+                } catch (Exception $e) {
+                    $srid = null;
+                    $query = $e->getMessage();
+                    $trace = $e->getTraceAsString();
+                    $message = submitfailed($this->gT("Unable to insert record into survey table"), $query . "\n\n" . $trace);
+                    LimeExpressionManager::addFrontendFlashMessage('error', $message, $this->sid);
+                    return $message;
+                }
             }
 
             //Insert Row for Timings, if needed
